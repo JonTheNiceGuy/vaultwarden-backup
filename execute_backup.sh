@@ -4,25 +4,30 @@
 # Setup
 # ##################################################################
 TARGET="$(mktemp -d)"
+
 cleanup() {
     trap - INT TERM EXIT
     if [ -n "${TARGET:-}" ]
     then
         if [ -e "$TARGET" ]
         then
-            rm -Rf "$TARGET"
+            if [ -z "${NOCLEAN:-}" ]
+            then
+                rm -Rf "$TARGET"
+            fi
         fi
     fi
 }
+
 trap cleanup INT TERM EXIT
 
 # ##################################################################
 # Reduce duplication of data
 # ##################################################################
 LAST=""
-if [ -e "/tmp/backup.md5" ]
+if [ -e "/tmp/backup.sort.md5" ]
 then
-    LAST="$(cat /tmp/backup.md5)"
+    LAST="$(cat /tmp/backup.sort.md5)"
 fi
 
 # ##################################################################
@@ -30,6 +35,7 @@ fi
 # ##################################################################
 TARGET_DB="${TARGET}/database"
 TARGET_FS="${TARGET}/files"
+
 mkdir -p "${TARGET_DB}" "${TARGET_FS}"
 
 # ##################################################################
@@ -105,24 +111,31 @@ fi
 cp -a "${DATA_FOLDER}/attachments" "${DATA_FOLDER}/sends" "${DATA_FOLDER}/config.json" "${DATA_FOLDER}/rsa_key"* "${TARGET_FS}"
 
 # ##################################################################
-# Compress all files ready for the backup job
-# ##################################################################
-tar cpfz "${TARGET}/vaultwarden.tgz" "${TARGET_DB}" "${TARGET_FS}"
-
-# ##################################################################
 # Prevent duplication
 # ##################################################################
-md5sum "${TARGET}/vaultwarden.tgz" > /tmp/backup.md5
+cd "${TARGET}" || exit 1
 
-if ! [ "$(cat /tmp/backup.md5)" = "$LAST" ]
+SHORT_TARGET_DB="$(echo "${TARGET_DB}" | sed -E "s~^${TARGET}/~~")"
+SHORT_TARGET_FS="$(echo "${TARGET_FS}" | sed -E "s~^${TARGET}/~~")"
+
+printf "" > /tmp/backup.md5
+find "$SHORT_TARGET_DB" "$SHORT_TARGET_FS" -type f -exec md5sum '{}' \; >> /tmp/backup.md5
+sort /tmp/backup.md5 > /tmp/backup.sort.md5
+
+if ! [ "$(cat /tmp/backup.sort.md5)" = "$LAST" ]
 then
+    # ##################################################################
+    # Compress all files ready for the backup job
+    # ##################################################################
+    tar cpfz "${TARGET}/vaultwarden.tgz" "$SHORT_TARGET_DB" "$SHORT_TARGET_FS"
 
     # ##################################################################
     # Encrypt and store backups
     # ##################################################################
+    
     if [ -n "$KMS_ARN" ] && [ -n "$S3_BUCKET" ]
     then
-        /usr/bin/kms-encrypt-and-s3-ship.py --trace "${TARGET}/vaultwarden.tgz"
+        /usr/bin/kms-encrypt-and-s3-ship.py "${TARGET}/vaultwarden.tgz"
     # If you have another method of encrypting (e.g. age, gpg) and storing (e.g. nfs), please create this below!
     else
         echo "Encryption and Storage method not defined. Aborting." >&2

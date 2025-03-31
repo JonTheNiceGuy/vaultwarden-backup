@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 
 import os
-import socket
 import boto3
+import shutil
+import socket
 import logging
 import argparse
-from datetime import datetime, timezone
-
+import requests
+import threading
+import subprocess
+from typing import Dict
 from bisect import bisect
 from logging import Formatter, LogRecord, StreamHandler
-from typing import Dict
+from datetime import datetime, timezone
 
 # ##################################################################
 # Logging stuff
@@ -23,7 +26,7 @@ class Colours:
     MAGENTA = '\033[95m'
     CYAN    = '\033[96m'
 
-    def __init__(self, nocolor = False):
+    def __init__(self, nocolor=False):
         self.__set_nocolor__(nocolor)
 
     def __set_nocolor__(self, nocolor):
@@ -44,19 +47,31 @@ class Colours:
             self.MAGENTA = ''
             self.CYAN    = ''
 
-COLOURS = Colours(bool(os.environ.get('nocolor', os.environ.get('NOCOLOR', False))))
+
+COLOURS = Colours(
+    bool(
+        os.environ.get(
+            'nocolor',
+            os.environ.get(
+                'NOCOLOR',
+                False
+            )
+        )
+    )
+)
+
 
 class Logger:
     __logger = None
 
-    TRACE=5
-    DEBUG=10
-    INFO=20
-    WARNING=30
-    ERROR=40
-    CRITICAL=50
+    TRACE    = 5
+    DEBUG    = 10
+    INFO     = 20
+    WARNING  = 30
+    ERROR    = 40
+    CRITICAL = 50
 
-    def __init__(self, args = None):
+    def __init__(self, args=None):
         handler = StreamHandler()
         handler.setFormatter(
             LevelFormatter(
@@ -76,14 +91,14 @@ class Logger:
         self.__logger.addHandler(handler)
         self.setLevelFromArgs(args)
 
-    def setLevelFromArgs(self, args = None):
+    def setLevelFromArgs(self, args=None):
         loglevel = self.INFO
         if os.environ.get('TRACE', None) is not None or (args is not None and args.trace):
             loglevel = self.TRACE
         if os.environ.get('DEBUG', None) is not None or (args is not None and args.debug):
             if loglevel != self.TRACE:
                 loglevel = self.DEBUG
-        
+
         self.setLevel(loglevel)
 
     def setLevel(self, loglevel):
@@ -110,6 +125,7 @@ class Logger:
     def critical(self, message):
         self.__logger.critical(message)
 
+
 class LevelFormatter(Formatter):
     def __init__(self, formats: Dict[int, str], **kwargs):
         super().__init__()
@@ -128,6 +144,16 @@ class LevelFormatter(Formatter):
         idx = bisect(self.formats, (record.levelno,), hi=len(self.formats)-1)
         _, formatter = self.formats[idx]
         return formatter.format(record)
+
+
+def stream_output(stream, stderr=False):
+    """Reads from a stream line-by-line and prints in real-time."""
+    for line in iter(stream.readline, ''):
+        if stderr:
+            logger.error(line.strip())
+        else:
+            logger.debug(line.strip())
+
 
 # ##################################################################
 # Argument Handling
@@ -191,6 +217,15 @@ def parseArgs() -> dict:
 
     if result.nocolor:
         COLOURS.__set_nocolor__(True)
+
+    if len(os.environ.get('DEBUG', "")) > 0:
+        if not result.debug:
+            result.debug = True
+
+    if len(os.environ.get('TRACE', "")) > 0:
+        if not result.trace:
+            result.trace = True
+
     logger.setLevelFromArgs(result)
 
     issues = []
@@ -200,10 +235,10 @@ def parseArgs() -> dict:
         issues.append('S3_BUCKET')
     if len(issues) > 0:
         raise Exception(f'Missing critical values: {", ".join(issues)}')
-    
+
     if not os.path.exists(result.source):
         raise FileNotFoundError(f'Missing source file {result.source}')
-    
+
     if os.path.exists(result.destination) and not result.overwrite:
         raise FileExistsError(f'File {result.destination} already exists')
 
@@ -213,50 +248,90 @@ def parseArgs() -> dict:
 
     return vars(result)
 
+
 # ##################################################################
 # Start Processing
 # ##################################################################
 logger = Logger()
+
 def main() -> None:
     args = parseArgs()
 
-    region=os.environ.get('AWS_REGION', os.environ.get('AWS_DEFAULT_REGION', None))
+    region = os.environ.get(
+        'AWS_REGION',
+        os.environ.get(
+            'AWS_DEFAULT_REGION',
+            None
+        )
+    )
 
     if region is None:
-        logger.trace('AWS Region not specified in an environment variable. Checking options.')
+        logger.trace(
+            'AWS Region not specified in an environment variable. Checking options.')
         try:
-            import requests
             region = requests.get(
                 "http://169.254.169.254/latest/meta-data/placement/region",
                 timeout=2
             ).text
         except requests.RequestException as e:
             raise Exception(f"Error fetching region: {e}")
-    
-    if str(args['kms_arn']).startswith('alias/') or str(args['kms_arn']).startswith('key/'):
-        sts_client = boto3.client('sts', region_name=region)
-        args['kms_arn'] = f'arn:aws:kms:eu-west-1:{sts_client.get_caller_identity()["Account"]}:{args["kms_arn"]}'
 
-    logger.trace('Creating KMS client')
-    kms_client = boto3.client("kms", region_name=region)
+    if str(args['kms_arn']).startswith('alias/') or str(args['kms_arn']).startswith('key/'):
+        logger.trace('KMS ARN does not have an account ID. Checking options.')
+        iam_data = requests.get(
+            "http://169.254.169.254/latest/meta-data/iam/info",
+            timeout=2
+        ).json()
+        iam_arn = iam_data.get('InstanceProfileArn', None)
+        if iam_arn is None:
+            raise Exception('Unable to find account ID to complete KMS ARN')
+        account_id = iam_arn.split(":")[4]
+        args['kms_arn'] = f'arn:aws:kms:{region}:{account_id}:{args["kms_arn"]}'
+
+    shutil.copy2(args['source'], args['destination'])
+
+    command = [
+        "sops",
+        "--in-place", "--encrypt", args['destination'],
+        "--output-type", "binary",
+    ]
+
+    env = os.environ.copy()
+    env['SOPS_KMS_ARN'] = args['kms_arn']
+
+    logger.trace(f'Starting encryption with {command}')
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env
+    ) as process:
+        stdout_thread = threading.Thread(
+            target=stream_output,
+            args=(
+                process.stdout,
+                False
+            )
+        )
+        stdout_thread.start()
+        stderr_thread = threading.Thread(
+            target=stream_output,
+            args=(
+                process.stderr,
+                True
+            )
+        )
+        stderr_thread.start()
+        process.wait()
+        stdout_thread.join()
+        stderr_thread.join()
+        if process.returncode > 0:
+            exit(1)
 
     logger.trace('Creating S3 client')
     s3_client = boto3.client("s3", region_name=region)
-
-    with open(args.get('source'), "rb") as file:
-        plaintext_data = file.read()
-
-    logger.trace(f'Read file {args.get("source")}')
-
-    encrypted_data = kms_client.encrypt(
-        KeyId = args.get('kms_arn'),
-        Plaintext = plaintext_data
-    )
-
-    logger.trace(f'Encrypted plaintext using key: {args.get("kms_arn")}')
-
-    with open(args.get('destination'), "wb") as file:
-        file.write(encrypted_data["CiphertextBlob"])
 
     logger.trace(f'Written file {args.get("destination")}')
 
@@ -266,7 +341,9 @@ def main() -> None:
         args.get('target')
     )
 
-    logger.info(f'Uploaded file {args.get("target")} to {args.get("s3_bucket")}')
+    logger.info(
+        f'Uploaded file {args.get("target")} to {args.get("s3_bucket")}')
+
 
 if __name__ == "__main__":
     try:

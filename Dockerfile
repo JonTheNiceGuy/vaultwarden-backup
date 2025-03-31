@@ -1,7 +1,9 @@
 ARG PYTHON_VERSION=3.12.3
 FROM docker.io/library/python:${PYTHON_VERSION}-alpine
 
-RUN apk add --no-cache mysql-client postgresql-client sqlite
+LABEL org.opencontainers.image.source https://github.com/jontheniceguy/vaultwarden-backup
+
+RUN apk add --no-cache mysql-client postgresql-client sqlite sops
 
 COPY requirements.txt /tmp
 RUN pip install --upgrade pip && pip install -r /tmp/requirements.txt && rm /tmp/requirements.txt
