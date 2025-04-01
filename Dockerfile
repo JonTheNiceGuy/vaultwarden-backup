@@ -1,7 +1,9 @@
-ARG PYTHON_VERSION=3.12.3
-FROM docker.io/library/python:${PYTHON_VERSION}-alpine
+ARG PYTHON_REGISTRY=docker.io
+ARG PYTHON_REPO=library/debian
+ARG PYTHON_RELEASE=3.12.3-alpine
+FROM ${PYTHON_REGISTRY}/${PYTHON_REPO}:${PYTHON_RELEASE}
 
-LABEL org.opencontainers.image.source https://github.com/jontheniceguy/vaultwarden-backup
+LABEL maintainer="Jon Spriggs <vaultwardenbackup@jon.sprig.gs>"
 
 RUN apk add --no-cache mysql-client postgresql-client sqlite sops
 
